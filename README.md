@@ -201,7 +201,7 @@ def compose_living(room, brief, catalog) -> list[Kit]:
 
 ## 4. 两条控制面，一套求解器
 
-客厅按钮和对话栏看起来是两套交互，底层汇合到同一对函数：`compose_living` + `check_living`。
+客厅按钮和对话栏看起来是两套交互，底层汇合到同一对函数：`compose_living` + `check_living`。语言层不能另开一条会编货的路径。
 
 | 用户动作 | 按钮 API | 对话工具 |
 |---|---|---|
@@ -210,52 +210,116 @@ def compose_living(room, brief, catalog) -> list[Kit]:
 | 换一件 | `/api/swap` `/api/replace` | `tweak_set` |
 | 效果图 | `POST /api/render` | `render_set` |
 
-对话不是「模型爱调什么就调什么」。`plan_turn` 根据缺尺寸、要改款还是要出图，给出**本轮允许的工具名单**。主持 tool loop 最多 6 步；调完一个工具再规划一次。名单外返回 `planner_blocked`。
+---
 
-```python
-# 伪代码：规划器先锁工具，主持只能在名单里转。
-def turn(user_text, session):
-    for _ in range(6):
-        plan = plan_turn(user_text, session)          # collect | compose | tweak | render | idle
-        if plan.action == "idle":
-            return reply_in_chinese(session)
-        if plan.action == "collect" and missing_cm(session):
-            return ask_for_cm(session)                # 禁止 compose
-        name, args = host_choose_tool(plan.allowlist) # 名单外 → planner_blocked
-        result = TOOLS[name](args, session)
-        session = guardian.apply(result, session)     # 用户厘米 > 预设 > 看图
-    return reply_in_chinese(session)
-```
+## Agent 规划设计
+
+不是 ReAct 自由发挥，也不是「一个大模型调一堆工具」。控制面、补丁面、求解面分开：规划器编译意图，专家只写自己能写的字段，求解器才碰货号和几何。
 
 ```mermaid
 flowchart TB
-  T[用户原话] --> PLAN[plan_turn]
-  PLAN --> ACT{本轮 action}
+  subgraph control [控制面 · 不改会话]
+    U[用户原话 + session.facts] --> P[plan_turn]
+    P --> EP[ExecutionPlan]
+    EP --> WL[本步 tools 白名单]
+  end
 
-  ACT -->|collect| SP[consult_space]
-  SP --> MISS{仍缺厘米?}
-  MISS -->|是| ASK[中文追问 禁止 compose]
-  MISS -->|否| PLAN
+  subgraph patch [补丁面 · 结构化、带来源]
+    H[主持 ≤ 6 步] --> SP[consult_space]
+    H --> TA[consult_taste]
+    H --> LK[consult_look]
+    SP --> G[guardian 来源格]
+    TA --> G
+    LK --> G
+  end
 
-  ACT -->|compose| TA[consult_taste 可选]
-  TA --> CS[compose_sets]
-  CS --> LOOK[consult_look 写纲领]
-  LOOK --> SOLVE[目录选货 + 硬门]
-  SOLVE --> REV[审查 可修一次]
-  REV --> PLAN
+  subgraph solve [求解面 · 无模型]
+    C[compose / tweak] --> FIT[check_living]
+    R[render_set] --> QA[render_qa]
+  end
 
-  ACT -->|tweak| TW[tweak_set]
-  TW --> FIT2[再过硬门]
-  FIT2 --> PLAN
-
-  ACT -->|render| HAS{已有套装?}
-  HAS -->|否| CS
-  HAS -->|是| RS[render_set]
-  RS --> QA[render_qa]
-  QA --> REPLY[短导购回复]
+  WL --> H
+  G --> S[session 事实]
+  H -->|名单内工具| C
+  H -->|已有锁定套装| R
+  S --> C
+  FIT -->|失败| DROP[内部列表]
+  FIT -->|通过| KIT[1–3 套]
+  KIT --> R
 ```
 
-主持只引用走道和失败原因，不编货号、不改厘米。规划器不改会话、不选货。审查可以修一次明显错误，不能把硬门改松。
+### 规划器是编译器，不是聊天摘要
+
+`plan_turn` 是纯函数：读会话事实和原话，写出 `ExecutionPlan`，**不改 session、不选 SKU、不放松硬门**。每调用完一个工具立刻再规划一次，所以名单会随事实前移——厘米齐了，`collect` 会升成 `compose`；用户要出图但还没有套装，本步是 `compose`，`goal` 记下延后的 `render`。
+
+| action | 本步允许的工具 | 何时出现 |
+|---|---|---|
+| `collect` | `consult_space` | `session.missing()`，禁止 compose |
+| `compose` | `consult_taste?` + `compose_sets` | 厘米齐、要出方案；或要出图但还没有套装 |
+| `tweak` | `consult_taste` + `tweak_set` | 已有套装，且用户在改款 |
+| `render` | `render_set` | 已有锁定套装，且用户要成图 |
+| `explain` / `idle` | 无工具 | 只解释当前货单，或没有新指令 |
+
+主持只能看见 `plan.tools` 里的 JSON schema。点名名单外的工具，运行时返回 `planner_blocked`，这条 tool call 不进求解器。
+
+```python
+# 伪代码：意图 → 阶段机；调完一步立刻重编译。
+Plan = Literal["collect", "compose", "tweak", "render", "explain", "idle"]
+
+def plan_turn(session, text) -> ExecutionPlan:
+    if session.missing():
+        return Plan("collect", tools=("consult_space",),
+                    goal="render" if wants_render(text) else "compose")
+    if wants_render(text) and session.current() is None:
+        return Plan("compose", tools=("compose_sets",), goal="render")
+    if wants_render(text):
+        return Plan("render", tools=("render_set",))
+    if session.current() and wants_tweak(text):
+        return Plan("tweak", tools=("consult_taste", "tweak_set"))
+    if session.current() is None:
+        return Plan("compose", tools=("compose_sets",))
+    return Plan("explain", tools=())
+
+SOURCE = {"vision": 10, "preset": 20, "user": 40}   # 硬字段只升不降
+HARD = {"w_cm", "d_cm", "budget_cny"}
+
+def turn(text, session):
+    used = set()
+    for _ in range(6):
+        plan = plan_turn(session, text)                 # 纯函数
+        if plan.action in ("idle", "explain"):
+            return reply_in_chinese(session)
+        schema = intersect(TOOLS, plan.tools)           # 模型只看见这些
+        call = host.choose(schema, session.facts)
+        if call.name not in plan.tools:
+            return Blocked("planner_blocked")
+        patch = SPECIALIST[call.name](text)             # 类型化补丁，不是散文
+        session = guardian.commit(session, patch, source=call.source)
+        used.add(call.name)
+    return ask_for_cm(session)
+```
+
+无 API key 时 `_rule_host` 吃**同一份** `ExecutionPlan`、同一批工具，不另开一条会编货的捷径。有模型和没模型，阶段机同构。
+
+### 工种按「能写哪一列」切开
+
+多角色不是为了像 Agent。每个角色有写集和禁区；补丁经 guardian 按来源优先级提交，冲突留痕，不靠 prompt 自觉。
+
+| 角色 | 写集 | 禁区 |
+|---|---|---|
+| 规划器 | `ExecutionPlan.action` + `tools` | 不改会话、不选货 |
+| 主持 | 调工具、用中文引用走道和失败原因 | 不编货号、不改厘米 |
+| 空间采集员 | 尺寸 / 预算 / 地板 JSON；没听到的字段必须空 | 猜厘米、点货号 |
+| 审美员 | `style` / `op` / `slot` | 点货号 |
+| 审美主持 | LookBrief 标签和点题件 | 写厘米、发明家具 |
+| 空间感知员 | SpaceRead 地板墙光，`dim_confidence=low` | 照片当尺寸事实 |
+| 守门 | 按来源接受或拒绝补丁 | 自己编数字 |
+| 求解器 | 目录 SKU + 硬门结论 | 跳过硬门、把失败套装交给用户 |
+| 出图 / 质检 | 锁定 SKU 摆进照片 | 没套装就画；用成图回写走道 |
+
+来源格（硬字段）：**用户亲口说的厘米 > 预设 > 看图推断**。看图可以帮人说话，不能覆盖用户已经锁定的面宽进深。
+
+审查可以修一次明显错误，不能把硬门改松。完整模块地图见 [系统流程图](./系统流程图.md)。
 
 ---
 
@@ -302,39 +366,16 @@ sequenceDiagram
 
 ---
 
-## Agent 工种
-
-多角色不是为了「更像 Agent」，是为了把会编造的能力拆开。每个角色有明确可写字段和禁区：
-
-| 角色 | 能写什么 | 铁律 |
-|---|---|---|
-| 主持 | 调工具、用中文讲走道和失败原因 | 不编货号、不改厘米 |
-| 规划器 | 本轮允许的工具名单 | 不改会话、不选货 |
-| 空间采集员 | 尺寸 / 预算 / 地板 JSON | 没听到的字段必须空 |
-| 审美员 | style / op / slot | 不点货号 |
-| 审美主持 | LookBrief 标签和点题件 | 组套前出场，仍不选货 |
-| 空间感知员 | SpaceRead 地板墙光 | 照片不当尺寸事实 |
-| 守门 | 按来源接受补丁 | 用户厘米优先 |
-| 求解器 | 目录 SKU + 硬门结论 | 失败必丢 |
-| 出图 | 锁定 SKU 摆进照片 | 没套装不许画 |
-
-完整模块地图、登录额度、部署边界见 [系统流程图](./系统流程图.md)。
-
----
-
 ## 技术要点（为什么这不是套一层 LLM）
 
-- **规划器约束的 tool loop**：本轮白名单 + 调完再规划，而不是 ReAct 自由发挥。
-- **双控制面收敛**：按钮和对话最终进同一求解器，避免「UI 一套规则、聊天另一套」。
+- **阶段机，不是 ReAct**：意图先编译成 `ExecutionPlan`，工具 schema 按步裁剪；调完再规划。延后意图用 `goal` 记住，不跳阶段。
+- **三面分离**：控制面不碰货，补丁面不碰几何，求解面不读散文。
+- **双控制面同构**：按钮和对话最终进同一套求解器；无模型降级走同一份计划。
+- **来源格**：厘米有 provenance 和优先级，冲突留痕，不靠 prompt 自觉。
 - **几何与目录在代码里**：硬门常数、SKU、购买链接都不从模型采样。
-- **事实有来源优先级**：厘米、风格、看图推断分开写，guardian 合并，而不是揉进一段 prompt。
 - **失败不可见但不丢**：过不了门的候选进失败列表，给主持解释用，不展示给用户当「也差不多」。
-- **出图是证明，不是决策**：合成发生在锁货之后；无套装拒绝；质检不能回写尺寸。
-- **无模型降级路径与有模型路径同构**：避免本地调试时走会幻觉的捷径。
+- **出图是证明，不是决策**：合成发生在锁货之后；质检不能回写尺寸。
 - **向量不选货**：金标图变成 LookBrief，求解器仍过硬门；不以图搜 SKU。
-
----
-
 
 ---
 
