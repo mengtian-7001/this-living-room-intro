@@ -60,6 +60,23 @@ flowchart LR
 
 硬门常数写在 `fit.py`，不是写在 prompt 里：沙发两侧各 20cm、沙发进深不超过房间 45%、走道 80cm、不超预算。失败进内部列表，不把「差一点就放下」交给模型去圆。
 
+```python
+# 伪代码：硬门。过不了就丢，不交给模型去圆。
+SIDE_CM, AISLE_CM, DEPTH_RATIO = 20, 80, 0.45
+
+def check_living(room, kit) -> Fit:
+    sofa = kit.sofa
+    if sofa.width + 2 * SIDE_CM > room.w_cm:
+        return Fail("两侧走道不够 20cm")
+    if sofa.depth > room.d_cm * DEPTH_RATIO:
+        return Fail("沙发进深超过房间 45%")
+    if leftover_aisle(room, kit) < AISLE_CM:
+        return Fail("走道不够 80cm")
+    if kit.price > room.budget:
+        return Fail("超预算")
+    return Ok()
+```
+
 ---
 
 ## 系统怎么分层
@@ -168,6 +185,23 @@ flowchart TB
   SCORE --> TOP[取 1–3 套]
 ```
 
+```python
+# 伪代码：沙发驱动组套。失败进内部列表，不展示给用户。
+def compose_living(room, brief, catalog) -> list[Kit]:
+    kept, dropped = [], []
+    for sofa in catalog.sofas.filter(brief.prefer_tags):
+        if check_living(room, Kit(sofa=sofa)).fail:
+            dropped.append(sofa); continue
+        kit = Kit(sofa=sofa)
+        kit += pick(catalog.tables, catalog.tv_benches, room, brief)
+        kit += maybe(catalog.lamps, catalog.rugs, catalog.chairs, room, brief)
+        if check_living(room, kit).fail:
+            dropped.append(kit); continue
+        kit.score = recipe_bonus(kit, brief) - anti_pattern(kit)
+        kept.append(kit)
+    return top(kept, n=3)   # dropped 只给主持解释用
+```
+
 每件货有货号和购买链接。目录分宜家可买件和高定询价件。目录里没有的 SKU，后面的合成也不会画。
 
 用户说「沙发再宽一点、灯换金属、预算压到五千」，走换货而不是重画一张图：改一件，再过硬门。过不了就换下一件候选，不把走道让出来。
@@ -186,6 +220,21 @@ flowchart TB
 | 效果图 | `POST /api/render` | `render_set` |
 
 对话不是「模型爱调什么就调什么」。`plan_turn` 根据缺尺寸、要改款还是要出图，给出**本轮允许的工具名单**。主持 tool loop 最多 6 步；调完一个工具再规划一次。名单外返回 `planner_blocked`。
+
+```python
+# 伪代码：规划器先锁工具，主持只能在名单里转。
+def turn(user_text, session):
+    for _ in range(6):
+        plan = plan_turn(user_text, session)          # collect | compose | tweak | render | idle
+        if plan.action == "idle":
+            return reply_in_chinese(session)
+        if plan.action == "collect" and missing_cm(session):
+            return ask_for_cm(session)                # 禁止 compose
+        name, args = host_choose_tool(plan.allowlist) # 名单外 → planner_blocked
+        result = TOOLS[name](args, session)
+        session = guardian.apply(result, session)     # 用户厘米 > 预设 > 看图
+    return reply_in_chinese(session)
+```
 
 ```mermaid
 flowchart TB
@@ -222,6 +271,16 @@ flowchart TB
 ## 5. 实景合成：锁货之后才画
 
 确认货单后，`render.py` 把空房照片和锁定 SKU 的货品图交给 Evolink，异步出图。前端拿 `pending + task_id` 轮询。没有套装，接口直接拒绝。
+
+```python
+# 伪代码：没有锁定货单，不许出图。
+def render_set(session, photo):
+    if not session.locked_kit:
+        return Reject("先确认货单")
+    task = evolink.start(room=photo, skus=session.locked_kit.image_urls)
+    image = wait(task)
+    return inline_data_url(image) if on_vercel else save_tmp(image)
+```
 
 成图回来后还有质检 `render_qa`：效果图不是实测，也不能反过来宣称走道可以少留。
 
